@@ -10,6 +10,7 @@ from fastcore.basics import patch
 
 from .detector import Detector
 from .renderers import Siddon, Trilinear
+from torch.utils.checkpoint import checkpoint
 
 # %% auto 0
 __all__ = ['DRR']
@@ -39,6 +40,8 @@ class DRR(nn.Module):
         patch_size: int | None = None,  # Render patches of the DRR in series
         renderer: str = "siddon",  # Rendering backend, either "siddon" or "trilinear"
         persistent: bool = True,  # Set persistent value in `torch.nn.Module.register_buffer`
+        gradient_checkpointing: bool = True,  # Use gradient checkpointing to save memory
+        compile: bool = True,  # Compile the renderer for performance
         **renderer_kwargs,  # Kwargs for the renderer
     ):
         super().__init__()
@@ -96,8 +99,11 @@ class DRR(nn.Module):
             raise ValueError(
                 f"renderer must be 'siddon' or 'trilinear', not {renderer}"
             )
+        if compile:
+            self.renderer = torch.compile(self.renderer, mode="default")
         self.reshape = reshape
         self.patch_size = patch_size
+        self.gradient_checkpointing = gradient_checkpointing
 
     def reshape_transform(self, img, batch_size):
         if self.reshape:
@@ -163,7 +169,10 @@ def forward(
 
     # Create the source / target points and render the image
     source, target = self.detector(pose, calibration)
-    img = self.render(self.density, source, target, mask_to_channels, **kwargs)
+    if self.gradient_checkpointing:
+        img = checkpoint(self.render, self.density, source, target, mask_to_channels, **kwargs, use_reentrant=False)
+    else:
+        img = self.render(self.density, source, target, mask_to_channels, **kwargs)
     return self.reshape_transform(img, batch_size=len(pose))
 
 
@@ -185,6 +194,7 @@ def render(
 
     # Render the image
     kwargs["mask"] = self.mask if mask_to_channels else None
+
     if self.patch_size is None:
         img = self.renderer(
             density,

@@ -6,6 +6,8 @@ __all__ = ['Siddon', 'Trilinear']
 # %% ../notebooks/api/01_renderers.ipynb 3
 import torch
 from torch.nn.functional import grid_sample
+from torch.utils.checkpoint import checkpoint
+
 
 # %% ../notebooks/api/01_renderers.ipynb 7
 class Siddon(torch.nn.Module):
@@ -15,9 +17,10 @@ class Siddon(torch.nn.Module):
         self,
         mode: str = "nearest",  # Interpolation mode for grid_sample
         stop_gradients_through_grid_sample: bool = False,  # Apply torch.no_grad when calling grid_sample
-        filter_intersections_outside_volume: bool = False,  # Use alphamin/max to filter the intersections
+        filter_intersections_outside_volume: bool = True,  # Use alphamin/max to filter the intersections
         reducefn: str = "sum",  # Function for combining samples along each ray
         eps: float = 1e-8,  # Small constant to avoid div by zero errors
+        gradient_checkpointing: bool = False,  # Use gradient checkpointing to save memory
     ):
         super().__init__()
         self.mode = mode
@@ -25,6 +28,7 @@ class Siddon(torch.nn.Module):
         self.filter_intersections_outside_volume = filter_intersections_outside_volume
         self.reducefn = reducefn
         self.eps = eps
+        self.gradient_checkpointing = gradient_checkpointing
 
     def dims(self, volume):
         return torch.tensor(volume.shape).to(volume)
@@ -41,35 +45,14 @@ class Siddon(torch.nn.Module):
         dims = self.dims(volume)
 
         # Calculate the intersections of each ray with the planes comprising the CT volume
-        alphas = _get_alphas(
-            source,
-            target,
-            dims,
-            self.eps,
-            self.filter_intersections_outside_volume,
-        )
 
-        # Calculate the midpoint of every pair of adjacent intersections
-        # These midpoints lie exclusively in a single voxel
-        alphamid = (alphas[..., :-1] + alphas[..., 1:]) / 2
-
-        # Get the XYZ coordinate of each midpoint (normalized to [-1, +1]^3)
-        xyzs = _get_xyzs(alphamid, source, target, dims, self.eps)
-
-        # Use torch.nn.functional.grid_sample to lookup the values of each intersected voxel
-        if self.stop_gradients_through_grid_sample:
-            with torch.no_grad():
-                img = _get_voxel(
-                    volume, xyzs, img, self.mode, align_corners=align_corners
-                )
+        # 1. Early Ray Rejection: Mask Entire Rays outside the volume
+        if self.gradient_checkpointing:
+            img, xyzs = checkpoint(self._compute_voxels, volume, source, target, dims, img, align_corners, use_reentrant=False)
         else:
-            img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
+            img, xyzs = self._compute_voxels(volume, source, target, dims, img, align_corners)
 
-        # Weight each intersected voxel by the length of the ray's intersection with the voxel
-        intersection_length = torch.diff(alphas, dim=-1)
-        img = img * intersection_length
 
-        # Handle optional masking
         if mask is None:
             img = reduce(img, self.reducefn)
             img = img.unsqueeze(1)
@@ -89,6 +72,35 @@ class Siddon(torch.nn.Module):
 
         return img
 
+    def _compute_voxels(self, volume, source, target, dims, img, align_corners=False):
+        """
+        Get the XYZ coordinates of the voxels intersected by the rays.
+        This function is used for checkpointing to save memory.
+        """
+        xyzs, intersection_lengths = self._compute_geometry(source, target, dims)
+        img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
+        img = img * intersection_lengths
+        return img, xyzs
+
+    def _compute_geometry(self, source, target, dims):
+        """
+        Checkpointed geometry computation.
+        This function's intermediate results won't be stored in memory.
+        """
+        # Calculate the intersections of each ray with the planes comprising the CT volume
+        alphas = _get_alphas(source, target, dims, self.eps, self.filter_intersections_outside_volume)
+
+        # Calculate the midpoint of every pair of adjacent intersections
+        alphamid = (alphas[..., :-1] + alphas[..., 1:]) / 2
+
+        # Get the XYZ coordinate of each midpoint
+        xyzs = _get_xyzs(alphamid, source, target, dims, self.eps)
+
+        # Calculate intersection lengths
+        intersection_lengths = torch.diff(alphas, dim=-1)
+
+        return xyzs, intersection_lengths
+
 # %% ../notebooks/api/01_renderers.ipynb 8
 def _get_alphas(source, target, dims, eps, filter_intersections_outside_volume):
     """Calculates the parametric intersections of each ray with the planes of the CT volume."""
@@ -97,15 +109,20 @@ def _get_alphas(source, target, dims, eps, filter_intersections_outside_volume):
     alphay = torch.arange(dims[1] + 1).to(source) - 0.5
     alphaz = torch.arange(dims[2] + 1).to(source) - 0.5
 
+
     # Calculate the parametric intersection of each ray with every plane
     sx, sy, sz = source[..., 0:1], source[..., 1:2], source[..., 2:3]
     tx, ty, tz = target[..., 0:1], target[..., 1:2], target[..., 2:3]
+    # r(α) reaches eventually all intersection planes represented by alphax,alphay,alphaz
+    # ray(α) = source + α * (target - source)
+    # α = (ray(α) - source) / (target - source)
+
     alphax = (alphax.expand(len(source), 1, -1) - sx) / (tx - sx + eps)
     alphay = (alphay.expand(len(source), 1, -1) - sy) / (ty - sy + eps)
     alphaz = (alphaz.expand(len(source), 1, -1) - sz) / (tz - sz + eps)
     alphas = torch.cat([alphax, alphay, alphaz], dim=-1)
 
-    # Sort the intersections
+    # Sort the intersections parameters α
     alphas = torch.sort(alphas, dim=-1).values
     if filter_intersections_outside_volume:
         alphas = _filter_intersections_outside_volume(alphas, source, target, dims, eps)
@@ -155,12 +172,16 @@ def _get_xyzs(alpha, source, target, dims, eps):
 def _get_voxel(volume, xyzs, img, mode, align_corners):
     """Wraps torch.nn.functional.grid_sample to sample a volume at XYZ coordinates."""
     batch_size = len(xyzs)
+
+    # we want to filter xyzs keep indices of original volume
+
     voxels = grid_sample(
         input=volume.permute(2, 1, 0)[None, None].expand(batch_size, -1, -1, -1, -1),
         grid=xyzs,
         mode=mode,
         align_corners=align_corners,
     )[:, 0, 0]
+    # img is actually ray lengths (see drr.py => img = (target-source)norm(dim=-1).unsqueeze(1))
     if img is not None:
         img = torch.einsum("bcn, bnj -> bnj", img, voxels)
     else:
@@ -249,3 +270,5 @@ class Trilinear(torch.nn.Module):
             )
 
         return img
+
+

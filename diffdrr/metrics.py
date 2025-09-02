@@ -35,7 +35,7 @@ class NormalizedCrossCorrelation2d(torch.nn.Module):
         x1, x2 = self.norm(x1), self.norm(x2)
         score = torch.einsum("b...,b...->b", x1, x2)
         score /= c * h * w
-        return score
+        return 1 - score
 
     def norm(self, x):
         mu = x.mean(dim=[-1, -2], keepdim=True)
